@@ -34,3 +34,20 @@ python3 -B demo.py
 - `read_receipt(store, receipt_id)` 与 `export_shift(store, shift_id)` 使用同一固定回执表示，读取过程无需设备。未知回执或班次抛 `LookupError`。数据库持久保存已签件和清册。
 
 已签回执的 `shift_id`、`order_id`、`position`、`raw` 和 `measurement` 可直接用于核对。`measurement` 包含精确规范量、判定和口径快照。
+
+## 两班共读一次实读
+
+双班共读让两个已开班的班次共用同一终端、同一在读位和一次设备实读，各按本班冻结口径领取自己的回执，接口定义见 `SHARED_READ.md`。
+
+- `Readout(terminal, store)` 不变。`Readout.begin_shared_read(other_shift_id)` 在发读前依次核准：对方班号已在档案登记、两班不同、终端当前实际档道同时落在两班清册内。任一资格失败都抛 `ReadOrderError`，不调用设备、不占用在读位；成功则只发一次设备读，锁存当前档道。单班 `begin_read` 与双班发读共用同一个在读位，任一在办时新的发读都被拒绝，操作员仍可继续选位。
+- `Readout.finish_shared_read(order_id, reply=None)` 沿用 `DeviceReply`、原回包校验和原码类型；省略回包时从设备领取，无回包返回 `ReadStage.PENDING`。回包必须匹配原读单和锁存档道，随后由 `capture/intake.py` 按两份冻结口径分别精确换算、分别判定，超限件同样签发。错用单班 `finish_read` 入口、未知读单、取消后迟回均抛 `ReadOrderError`/`ReplyError`，当前在办保留。取消共用 `cancel_read`。
+- 成功返回 `archive.receipts.SharedReceipt`，公开字段为 `order_id`（设备真实读单号）、`position`（原锁存档道）、`raw`（整数或原始文本原码）和 `receipts`（本班 `Receipt` 在前、另一班在后的二元组）。两个成员各自携带本班口径快照与判定，保留共同读单号、档道和原码，回执号彼此不同，并与单班回执共用原持久回执号空间。
+- 双件在同一 SQLite 事务内联合写入，同次提交后才同时可见；提交失败整体回滚，原待办读单和已验原包保留，故障解除后用原 `order_id` 再调 `finish_shared_read(order_id)` 续办，不重新发读、不重新投递。成功后省略回包或重投完全相同的原证据都返回原组及原回执号；整数 `6` 与文本 `"6.0"` 是不同证据，改原值、错原单、错档道、错绑成员一律拒绝。已签双班原读单对旧单件写入口报冲突，单班归属同样保持不变。
+- `read_receipt(store, receipt_id)` 仍按号返回单个 `Receipt`，`export_shift(store, shift_id)` 仍按持久回执号返回本班全量记录并包含本班新签的双班成员。新增 `archive.readback.read_shared_receipt(store, receipt_id)`：任一成员号都返回同一个 `SharedReceipt`，旧单件号返回 `None`，未知号抛 `LookupError`。
+- 停源重开档案后，按号和按班入口都能取回原结果。已有的 V1 库在首次打开时于单事务内迁移：原 `receipts` 表重建为带 `kind`（`single`/`shared`）判别列的同号空间，旧编号、正文和领取行为完全保留，新联合绑定登记在 `shared_orders` 表。在办续办只保留在原会话的内存读单中，跨重开需按持久回执号领取。
+
+### 共同原单与班次回执的交接
+
+一次共读只有一个设备原读单号和一份锁存证据（档道、原码）。设备只被调用一次，`SimulatedDevice.reads` 记录这次实际锁存；两份班次回执不是两次测量，而是对同一份原证据按各自冻结口径的两次独立精确换算与判定。联合签发把两个成员写进同一回执号空间并在 `shared_orders` 登记“本班/另一班”绑定，因此晚班或复核班停源重开后，凭任一成员回执号即可经 `read_shared_receipt` 还原整组，经 `read_receipt` 取本班单件，经 `export_shift` 按班核对，原读单号、档道、原码和两班判定都可逐项对齐。
+
+`shared_examples.open_example(store)` 提供早班、复核班（仅覆盖 A/2，上限 5/2 kPa）、计次设备、人工终端和读单工作流；`python3 -B shared_examples.py` 同时自检 V1 单件夹具与双班共读夹具（资格、迟回、重投冲突、联合提交失败与原读续办）。

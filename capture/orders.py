@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from enum import Enum
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from archive.receipts import Receipt
@@ -9,6 +10,9 @@ from capture.replies import ReplyError, ValidatedReply
 from shift.catalog import Position
 from shift.configuration import ShiftConfig
 from terminal.device import LatchedRead
+
+if TYPE_CHECKING:
+    from archive.receipts import SharedReceipt
 
 
 class ReadOrderError(ValueError):
@@ -21,6 +25,11 @@ class ReadStage(str, Enum):
     SIGNED = 'signed'
 
 
+class ReadKind(str, Enum):
+    SINGLE = 'single'
+    SHARED = 'shared'
+
+
 @dataclass(frozen=True, slots=True)
 class ReadOrder:
     shift: ShiftConfig
@@ -28,6 +37,9 @@ class ReadOrder:
     stage: ReadStage = ReadStage.PENDING
     reply: ValidatedReply | None = None
     receipt_id: int | None = None
+    kind: ReadKind = ReadKind.SINGLE
+    other_shift: ShiftConfig | None = None
+    other_receipt_id: int | None = None
 
     @property
     def order_id(self) -> str:
@@ -73,6 +85,23 @@ class ReadOrders:
         self._pending = order_id
         return order
 
+    def add_shared_latched(
+        self, order_id: str, shift: ShiftConfig, other_shift: ShiftConfig,
+        latched: LatchedRead,
+    ) -> ReadOrder:
+        self.require_available()
+        if order_id in self._orders or latched.order_id != order_id:
+            raise ReadOrderError(f'invalid latched identity for {order_id!r}')
+        if not shift.catalog.contains(latched.position):
+            raise ReadOrderError(f'latched position is outside shift {shift.shift_id!r}')
+        if not other_shift.catalog.contains(latched.position):
+            raise ReadOrderError(
+                f'latched position is outside shift {other_shift.shift_id!r}')
+        order = ReadOrder(shift, latched, kind=ReadKind.SHARED, other_shift=other_shift)
+        self._orders[order_id] = order
+        self._pending = order_id
+        return order
+
     def record_reply(self, order_id: str, reply: ValidatedReply) -> ReadOrder:
         order = self.require_pending(order_id)
         if reply.order_id != order_id or (order.reply is not None and order.reply != reply):
@@ -88,6 +117,23 @@ class ReadOrders:
                 or receipt.raw != order.reply.raw):
             raise ReadOrderError(f'receipt does not match order {order_id!r}')
         self._orders[order_id] = replace(order, stage=ReadStage.SIGNED, receipt_id=receipt.receipt_id)
+        self._pending = None
+
+    def mark_shared_signed(self, order_id: str, group: SharedReceipt) -> None:
+        order = self.require_pending(order_id)
+        home, other = group.receipts
+        if (order.reply is None or home.order_id != order_id or other.order_id != order_id
+                or home.position != order.position or other.position != order.position
+                or home.raw != order.reply.raw or other.raw != order.reply.raw
+                or home.shift_id != order.shift.shift_id
+                or order.other_shift is None
+                or other.shift_id != order.other_shift.shift_id
+                or home.receipt_id == other.receipt_id):
+            raise ReadOrderError(f'shared receipt does not match order {order_id!r}')
+        self._orders[order_id] = replace(
+            order, stage=ReadStage.SIGNED,
+            receipt_id=home.receipt_id, other_receipt_id=other.receipt_id,
+        )
         self._pending = None
 
     def cancel(self, order_id: str) -> ReadStage:
